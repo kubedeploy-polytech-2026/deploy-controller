@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"kubedeploy/deploy-controller/internal/execution"
+	"kubedeploy/deploy-controller/internal/githubapp"
 	"kubedeploy/deploy-controller/internal/intake"
 )
 
@@ -56,6 +57,19 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	github := intake.GitHub{Run: intake.RunGH}
+	config, appEnabled, err := githubapp.FromEnv(os.Getenv)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if appEnabled {
+		source, err := githubapp.New(config)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		github.Run = githubapp.Runner(source, intake.RunGHWithEnv)
+	}
 	step := func(ctx context.Context) (intake.Plan, error) {
 		verifyCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 		defer cancel()
