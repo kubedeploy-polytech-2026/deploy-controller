@@ -25,8 +25,13 @@ func (b *limitedBuffer) Write(p []byte) (int, error) {
 }
 
 func RunGH(ctx context.Context, args ...string) ([]byte, error) {
+	return RunGHWithEnv(ctx, nil, args...)
+}
+
+func RunGHWithEnv(ctx context.Context, env []string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "gh", args...)
 	cmd.Env = append(os.Environ(), "GH_HOST=github.com", "GH_PROMPT_DISABLED=1", "GH_PAGER=cat")
+	cmd.Env = append(cmd.Env, env...)
 	var stdout, stderr limitedBuffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
