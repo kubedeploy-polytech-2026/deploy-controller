@@ -1,0 +1,9 @@
+.git
+.github
+.tools
+build
+**/*.pem
+**/*.key
+**/.env
+**/.env.*
+**/github-app.env
