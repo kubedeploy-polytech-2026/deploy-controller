@@ -1,8 +1,10 @@
 .DEFAULT_GOAL := help
+IMAGE ?= kubedeploy-controller:dev
 
-.PHONY: help test build check
+.PHONY: help test build check image smoke
 help:
 	@printf '%s\n' 'test   Run unit tests with race detection' 'build  Build the controller' 'check  Test, vet and build'
+	@printf '%s\n' 'image  Build the controller image' 'smoke  Check the container runtime'
 test:
 	go test -race ./...
 build:
@@ -10,3 +12,9 @@ build:
 check: test
 	go vet ./...
 	$(MAKE) build
+
+image:
+	docker build --tag $(IMAGE) .
+
+smoke:
+	IMAGE='$(IMAGE)' bash scripts/test-image.sh

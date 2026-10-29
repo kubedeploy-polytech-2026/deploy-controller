@@ -14,8 +14,16 @@ concurrency:
 
 jobs:
   check:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -28,3 +36,22 @@ jobs:
         run: test -z "$(gofmt -l .)"
       - name: Test, vet and build
         run: make check
+      - name: Build container
+        run: make image
+      - name: Check container runtime
+        run: make smoke
+      - name: Install pinned Trivy
+        run: bash scripts/install-trivy.sh
+      - name: Reject fixable HIGH and CRITICAL vulnerabilities
+        run: |
+          .tools/bin/trivy image --quiet --timeout 15m --db-repository ghcr.io/aquasecurity/trivy-db:2 \
+            --scanners vuln --ignore-unfixed --severity HIGH,CRITICAL --exit-code 1 \
+            --format json --output trivy.json kubedeploy-controller:dev
+      - name: Upload vulnerability report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: trivy-${{ matrix.arch }}
+          path: trivy.json
+          if-no-files-found: warn
+          retention-days: 14
