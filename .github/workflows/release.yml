@@ -1,0 +1,125 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+    outputs:
+      revision: ${{ steps.release.outputs.revision }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate tag and main commit
+        id: release
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: bash scripts/verify-release.sh
+      - name: Reject an already published release
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          status="$(gh api --include --silent "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" 2>/dev/null | awk 'NR == 1 {print $2}' || true)"
+          if [[ "$status" != 404 ]]; then
+            echo 'Release already exists, or its absence could not be verified' >&2
+            exit 1
+          fi
+
+  checks:
+    needs: verify
+    uses: ./.github/workflows/ci.yml
+    with:
+      release-tag: ${{ github.ref_name }}
+
+  publish:
+    needs: [verify, checks]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ github.ref_name }}
+      REVISION: ${{ needs.verify.outputs.revision }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: candidate-amd64
+          path: candidates/amd64
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: candidate-arm64
+          path: candidates/arm64
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish scanned images and manifest index
+        id: image
+        run: bash scripts/publish-images.sh
+      - name: Attest image provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ steps.image.outputs.image }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+      - name: Attest amd64 SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ steps.image.outputs.image }}
+          subject-digest: ${{ steps.image.outputs.amd64 }}
+          sbom-path: dist/sbom-amd64.cdx.json
+          push-to-registry: true
+          create-storage-record: false
+      - name: Attest arm64 SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ steps.image.outputs.image }}
+          subject-digest: ${{ steps.image.outputs.arm64 }}
+          sbom-path: dist/sbom-arm64.cdx.json
+          push-to-registry: true
+          create-storage-record: false
+      - name: Verify provenance and publish release metadata
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          verified=false
+          for attempt in 1 2 3 4 5; do
+            if gh attestation verify "oci://$IMAGE@$DIGEST" --repo "$GITHUB_REPOSITORY" \
+              --source-digest "$REVISION" --source-ref "$GITHUB_REF" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml"; then
+              verified=true
+              break
+            fi
+            echo "Waiting for attestation availability ($attempt/5)" >&2
+            sleep 5
+          done
+          [[ "$verified" == true ]]
+          printf '%s\n' "Image: $IMAGE@$DIGEST" "Revision: $REVISION" > dist/notes.md
+          gh release create "$RELEASE_TAG" --verify-tag --title "$RELEASE_TAG" \
+            --notes-file dist/notes.md dist/release.json dist/*.cdx.json dist/trivy-*.json
+          cat dist/notes.md >> "$GITHUB_STEP_SUMMARY"

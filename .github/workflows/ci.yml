@@ -4,6 +4,12 @@ on:
   push:
     branches: ['**']
   pull_request:
+  workflow_call:
+    inputs:
+      release-tag:
+        type: string
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -24,6 +30,8 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    env:
+      RELEASE_TAG: ${{ inputs.release-tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -36,17 +44,23 @@ jobs:
         run: test -z "$(gofmt -l .)"
       - name: Test, vet and build
         run: make check
+      - name: Test release guards
+        run: python3 -m unittest discover -s tests -v
       - name: Build container
-        run: make image
+        run: |
+          docker build --provenance=false --tag kubedeploy-candidate:build \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.version=${RELEASE_TAG:-dev}" .
       - name: Check container runtime
-        run: make smoke
+        run: make smoke IMAGE=kubedeploy-candidate:build
       - name: Install pinned Trivy
         run: bash scripts/install-trivy.sh
       - name: Reject fixable HIGH and CRITICAL vulnerabilities
         run: |
           .tools/bin/trivy image --quiet --timeout 15m --db-repository ghcr.io/aquasecurity/trivy-db:2 \
             --scanners vuln --ignore-unfixed --severity HIGH,CRITICAL --exit-code 1 \
-            --format json --output trivy.json kubedeploy-controller:dev
+            --format json --output trivy.json kubedeploy-candidate:build
       - name: Upload vulnerability report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -55,3 +69,21 @@ jobs:
           path: trivy.json
           if-no-files-found: warn
           retention-days: 14
+      - name: Prepare scanned candidate and SBOM
+        if: inputs.release-tag != ''
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: bash scripts/prepare-candidate.sh
+      - name: Upload scanned candidate
+        if: inputs.release-tag != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: candidate-${{ matrix.arch }}
+          path: |
+            image.tar.gz
+            candidate.json
+            sbom.cdx.json
+            trivy.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1

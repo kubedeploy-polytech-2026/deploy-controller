@@ -1,1 +1,9 @@
 /build/
+/.tools/
+/candidates/
+/dist/
+/image.tar.gz
+/image-inspect.json
+/candidate.json
+/sbom.cdx.json
+/trivy.json
