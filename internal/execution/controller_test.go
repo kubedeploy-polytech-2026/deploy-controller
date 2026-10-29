@@ -41,7 +41,7 @@ func (g *fakeGitHub) TagRevision(context.Context, string, string) (string, error
 	return g.p.Backend.Revision, nil
 }
 func (g *fakeGitHub) Verify(context.Context, intake.Release) error { return nil }
-func (g *fakeGitHub) WriteStatus(_ context.Context, id int64, state string) error {
+func (g *fakeGitHub) WriteStatus(_ context.Context, id int64, state string, reason ...string) error {
 	if id != g.d.ID {
 		return errors.New("wrong deployment")
 	}
@@ -54,16 +54,37 @@ func (g *fakeGitHub) WriteStatus(_ context.Context, id int64, state string) erro
 }
 
 type fakeExecutor struct {
-	readyErr, applyErr error
-	calls              int
-	plan               intake.Plan
+	readyErr, prepareErr, applyErr, waitErr, smokeErr error
+	waitCalls, smokeCalls                             int
+	waitFn                                            func(context.Context) error
+	smokeFn                                           func(context.Context) error
+	calls                                             int
+	plan                                              intake.Plan
 }
 
-func (e *fakeExecutor) Ready(context.Context) error { return e.readyErr }
-func (e *fakeExecutor) Apply(_ context.Context, p intake.Plan) error {
+func (e *fakeExecutor) Ready(context.Context) error                { return e.readyErr }
+func (e *fakeExecutor) Prepare(context.Context, intake.Plan) error { return e.prepareErr }
+func (e *fakeExecutor) Wait(ctx context.Context, _ intake.Plan, _ Snapshot, _ time.Time) error {
+	e.waitCalls++
+	if e.waitFn != nil {
+		return e.waitFn(ctx)
+	}
+	return e.waitErr
+}
+func (e *fakeExecutor) Smoke(ctx context.Context, _ intake.Plan, _ Snapshot) error {
+	e.smokeCalls++
+	if e.smokeFn != nil {
+		return e.smokeFn(ctx)
+	}
+	return e.smokeErr
+}
+func (e *fakeExecutor) Diagnose(context.Context, intake.Plan) ([]byte, error) {
+	return []byte(`{"items":[]}`), nil
+}
+func (e *fakeExecutor) Apply(_ context.Context, p intake.Plan) (Snapshot, error) {
 	e.calls++
 	e.plan = p
-	return e.applyErr
+	return testSnapshot(p), e.applyErr
 }
 
 func fixture(t *testing.T) (Controller, *fakeGitHub, *fakeExecutor) {
@@ -138,7 +159,7 @@ func TestFailureAndStatusRetryNeverReapply(t *testing.T) {
 			c, g, e := fixture(t)
 			want := "success"
 			if failApply {
-				e.applyErr = errors.New("rollout failed")
+				e.waitErr = &Failure{Reason: "rollout stopped progressing"}
 				want = "failure"
 			}
 			g.failWrite = want
@@ -209,5 +230,170 @@ func TestStateLockAndCorruption(t *testing.T) {
 	}
 	if _, err = s.Load(); err == nil {
 		t.Fatal("corrupt journal ignored")
+	}
+}
+
+func testSnapshot(p intake.Plan) Snapshot {
+	return Snapshot{"backend": {UID: "backend-uid", Generation: 1, Image: p.BackendImage}, "frontend": {UID: "frontend-uid", Generation: 1, Image: p.FrontendImage}}
+}
+
+func TestObservationResumesAfterRestartWithoutApply(t *testing.T) {
+	c, g, e := fixture(t)
+	e.waitErr = errors.New("temporary Kubernetes API failure")
+	if p, err := c.Step(context.Background()); err == nil || p.State != "in_progress" {
+		t.Fatalf("expected resumable observation: %+v %v", p, err)
+	}
+	j, err := c.Store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline, phaseDeadline := j.Deadline, j.PhaseDeadline
+	expired := c.Now().Add(-time.Minute)
+	j.Plan.ExpiresAt = &expired
+	if err = c.Store.Save(*j); err != nil {
+		t.Fatal(err)
+	}
+	dir := c.Store.dir
+	c.Store.Close()
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	c.Store = store
+	resumed := &fakeExecutor{waitFn: func(ctx context.Context) error {
+		actual, _ := ctx.Deadline()
+		if !actual.Equal(phaseDeadline) {
+			t.Fatal("restart reset the rollout deadline")
+		}
+		return nil
+	}}
+	c.Executor = resumed
+	c.Budgets = Budgets{Total: time.Minute, Apply: time.Minute, Rollout: time.Minute, Smoke: time.Minute}
+	p, err := c.Step(context.Background())
+	if err != nil || p.State != "success" || resumed.calls != 0 || e.calls != 1 {
+		t.Fatalf("resume: %+v %v original=%d resumed=%d", p, err, e.calls, resumed.calls)
+	}
+	saved, _ := c.Store.Load()
+	if !saved.Deadline.Equal(deadline) || !reflect.DeepEqual(g.writes, []string{"in_progress", "success"}) {
+		t.Fatal("restart changed deadline or reapplied status")
+	}
+}
+
+func TestSmokeResumesWithoutRepeatingRollout(t *testing.T) {
+	c, _, e := fixture(t)
+	e.smokeErr = errors.New("temporary HTTP failure")
+	if _, err := c.Step(context.Background()); err == nil {
+		t.Fatal("expected smoke retry")
+	}
+	j, _ := c.Store.Load()
+	if j.Phase != "smoke" {
+		t.Fatal("smoke checkpoint not persisted")
+	}
+	resumed := &fakeExecutor{}
+	c.Executor = resumed
+	if p, err := c.Step(context.Background()); err != nil || p.State != "success" {
+		t.Fatalf("smoke resume %+v %v", p, err)
+	}
+	if resumed.calls != 0 || resumed.waitCalls != 0 || resumed.smokeCalls != 1 {
+		t.Fatal("smoke recovery repeated apply or rollout")
+	}
+}
+
+func TestDeadlineReportsErrorWithDiagnostics(t *testing.T) {
+	for _, phase := range []string{"waiting", "smoke"} {
+		t.Run(phase, func(t *testing.T) {
+			c, g, e := fixture(t)
+			clock := c.Now()
+			c.Now = func() time.Time { return clock }
+			timeout := func(context.Context) error { clock = clock.Add(11 * time.Minute); return context.DeadlineExceeded }
+			want := "rollout timeout"
+			if phase == "waiting" {
+				e.waitFn = timeout
+			} else {
+				e.smokeFn = timeout
+				want = "smoke timeout"
+			}
+			p, err := c.Step(context.Background())
+			if err != nil || p.State != "error" || p.Reason != want || g.state != "error" {
+				t.Fatalf("timeout result %+v %v", p, err)
+			}
+			raw, err := os.ReadFile(filepath.Join(c.Store.dir, "diagnostics-42.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var diag map[string]any
+			if err = json.Unmarshal(raw, &diag); err != nil || diag["reason"] != want || diag["expected"] == nil {
+				t.Fatal("missing timeout diagnostics")
+			}
+			before := e.calls
+			if _, err = c.Step(context.Background()); err != nil || e.calls != before {
+				t.Fatal("deadline triggered another apply")
+			}
+		})
+	}
+}
+
+func TestCancellationPreservesObservation(t *testing.T) {
+	c, g, e := fixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	e.waitFn = func(context.Context) error { cancel(); return context.Canceled }
+	if _, err := c.Step(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected cancellation: %v", err)
+	}
+	j, _ := c.Store.Load()
+	if j.Phase != "waiting" || j.State != "in_progress" || j.Reported || g.state != "in_progress" {
+		t.Fatal("cancellation destroyed observation checkpoint")
+	}
+	c.Executor = &fakeExecutor{}
+	if p, err := c.Step(context.Background()); err != nil || p.State != "success" {
+		t.Fatalf("cancelled observer did not recover: %+v %v", p, err)
+	}
+}
+
+func TestExternalCancellationDoesNotGetOverwritten(t *testing.T) {
+	c, g, e := fixture(t)
+	e.waitErr = errors.New("temporary read failure")
+	if _, err := c.Step(context.Background()); err == nil {
+		t.Fatal("expected retry")
+	}
+	g.state = "inactive"
+	if p, err := c.Step(context.Background()); err != nil || p.State != "error" {
+		t.Fatalf("external cancel %+v %v", p, err)
+	}
+	if g.state != "inactive" || !reflect.DeepEqual(g.writes, []string{"in_progress"}) {
+		t.Fatal("overwrote external cancellation")
+	}
+}
+
+func TestUnknownApplyOutcomeNeverRepeats(t *testing.T) {
+	c, g, e := fixture(t)
+	e.applyErr = errors.New("connection lost during apply")
+	p, err := c.Step(context.Background())
+	if err != nil || p.State != "error" || g.state != "error" || e.waitCalls != 0 {
+		t.Fatalf("ambiguous apply %+v %v", p, err)
+	}
+	if _, err = c.Step(context.Background()); err != nil || e.calls != 1 {
+		t.Fatal("repeated ambiguous apply")
+	}
+}
+
+func TestPreflightAndInvalidJournalStayFailClosed(t *testing.T) {
+	c, g, e := fixture(t)
+	e.prepareErr = errors.New("environment contract unavailable")
+	if _, err := c.Step(context.Background()); err == nil || e.calls != 0 || len(g.writes) != 0 {
+		t.Fatal("preflight changed queued request")
+	}
+	p := intake.Plan{DeploymentID: 42, EnvironmentRevision: g.p.EnvironmentRevision, BackendImage: "ghcr.io/" + intake.Organization + "/backend@" + g.p.Backend.Digest, FrontendImage: "ghcr.io/" + intake.Organization + "/frontend@" + g.p.Frontend.Digest}
+	j := Journal{Plan: p, State: "in_progress", Phase: "waiting", Deadline: time.Now().Add(time.Minute), PhaseDeadline: time.Now().Add(time.Hour), Snapshot: testSnapshot(p)}
+	c.Store.Save(j)
+	if _, err := c.Store.Load(); err == nil {
+		t.Fatal("accepted phase deadline past overall deadline")
+	}
+	j.PhaseDeadline = j.Deadline
+	j.Snapshot["backend"] = Identity{UID: "wrong", Generation: 1, Image: "untrusted"}
+	c.Store.Save(j)
+	if _, err := c.Store.Load(); err == nil {
+		t.Fatal("accepted untrusted saved snapshot")
 	}
 }
