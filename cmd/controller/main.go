@@ -6,6 +6,8 @@ import (
 	"flag"
 	"fmt"
 	"math/rand/v2"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -13,6 +15,7 @@ import (
 
 	"kubedeploy/deploy-controller/internal/execution"
 	"kubedeploy/deploy-controller/internal/githubapp"
+	"kubedeploy/deploy-controller/internal/health"
 	"kubedeploy/deploy-controller/internal/intake"
 )
 
@@ -69,6 +72,7 @@ func mainRun() error {
 	flag.DurationVar(&budgets.Rollout, "rollout-timeout", budgets.Rollout, "Shared rollout budget")
 	flag.DurationVar(&budgets.Smoke, "smoke-timeout", budgets.Smoke, "Smoke check budget")
 	stateDir := flag.String("state-dir", "", "Persistent local state directory for one executor")
+	healthAddress := flag.String("health-address", "", "HTTP probe listen address (disabled when empty)")
 	flag.Parse()
 	if *interval < 10*time.Second || flag.NArg() != 0 {
 		return fmt.Errorf("expected no arguments and interval >= 10s")
@@ -106,7 +110,36 @@ func mainRun() error {
 		controller := execution.Controller{GitHub: github, Executor: commands, Store: store, Now: time.Now, Budgets: budgets}
 		step = controller.Step
 	}
-	return run(ctx, *once, *interval, step)
+	status := &health.Status{}
+	var serverErrors <-chan error
+	if *healthAddress != "" {
+		listener, err := net.Listen("tcp", *healthAddress)
+		if err != nil {
+			return fmt.Errorf("health listener: %w", err)
+		}
+		server := &http.Server{Handler: status.Handler(), ReadHeaderTimeout: 5 * time.Second,
+			WriteTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
+		defer server.Close()
+		failures := make(chan error, 1)
+		serverErrors = failures
+		go func() {
+			if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
+				failures <- err
+				stop()
+			}
+		}()
+	}
+	err = run(ctx, *once, *interval, func(ctx context.Context) (intake.Plan, error) {
+		plan, err := step(ctx)
+		status.Record(err)
+		return plan, err
+	})
+	select {
+	case serverErr := <-serverErrors:
+		return fmt.Errorf("health server: %w", serverErr)
+	default:
+		return err
+	}
 }
 
 func main() {

@@ -29,7 +29,11 @@ docker run --rm "${runtime[@]}" --entrypoint bash "$IMAGE" -ceu '
   /usr/local/bin/deploy-controller --help >/dev/null 2>&1
 '
 mkdir -p "$work_dir/fixtures"
-printf '#!/bin/sh\nprintf '\''[[]]\\n'\''\n' > "$work_dir/fixtures/gh"
+cat > "$work_dir/fixtures/gh" <<'SH'
+#!/bin/sh
+[ ! -e /state/fail-poll ] || exit 1
+printf '[[]]\n'
+SH
 chmod 755 "$work_dir/fixtures" "$work_dir/fixtures/gh"
 fake_cli=(--mount "type=bind,src=$work_dir/fixtures,dst=/fixtures,readonly"
   --env PATH=/fixtures:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin)
@@ -40,14 +44,34 @@ import json,sys
 with open(sys.argv[1]) as f:
     assert json.load(f) == {"state": "idle"}
 PY
-docker run --detach --name "$name" "${runtime[@]}" "${fake_cli[@]}" "$IMAGE" >/dev/null
+docker run --detach --name "$name" "${runtime[@]}" "${fake_cli[@]}" "$IMAGE" \
+  --execute --state-dir /state --interval 10s --health-address 127.0.0.1:8081 >/dev/null
+probe() {
+  docker exec "$name" curl --silent --max-time 2 --output /dev/null --write-out '%{http_code}' \
+    "http://127.0.0.1:8081/$1" 2>/dev/null || true
+}
 ready=false
 for ((attempt=0; attempt<30; attempt++)); do
-  if docker logs "$name" 2>/dev/null | grep -q '"state":"idle"'; then ready=true; break; fi
+  if [[ "$(probe readyz)" == 200 ]]; then ready=true; break; fi
+  sleep 1
+done
+[[ "$ready" == true ]]
+[[ "$(probe healthz)" == 200 ]]
+docker exec "$name" touch /state/fail-poll
+failed=false
+for ((attempt=0; attempt<30; attempt++)); do
+  if [[ "$(probe readyz)" == 503 ]]; then failed=true; break; fi
+  sleep 1
+done
+[[ "$failed" == true && "$(probe healthz)" == 200 ]]
+docker exec "$name" rm /state/fail-poll
+ready=false
+for ((attempt=0; attempt<30; attempt++)); do
+  if [[ "$(probe readyz)" == 200 ]]; then ready=true; break; fi
   sleep 1
 done
 [[ "$ready" == true ]]
 docker exec "$name" sh -c 'test "$(cat /state/persistence-check)" = persisted; test "$(readlink /proc/1/exe)" = /usr/local/bin/deploy-controller'
 docker stop --time 5 "$name" >/dev/null
 [[ "$(docker wait "$name")" == 0 ]]
-echo 'Container smoke passed: tools, non-root, read-only root, persistent state and SIGTERM'
+echo 'Container smoke passed: tools, non-root, read-only root, persistent state, probes, recovery and SIGTERM'
