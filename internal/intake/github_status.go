@@ -6,7 +6,7 @@ import (
 	"strconv"
 )
 
-func (g GitHub) WriteStatus(ctx context.Context, id int64, state string) error {
+func (g GitHub) WriteStatus(ctx context.Context, id int64, state string, reason ...string) error {
 	descriptions := map[string]string{
 		"in_progress": "Applying verified environment revision",
 		"success":     "Rollouts and Gateway smoke passed",
@@ -16,6 +16,12 @@ func (g GitHub) WriteStatus(ctx context.Context, id int64, state string) error {
 	description, ok := descriptions[state]
 	if !ok || id <= 0 {
 		return fmt.Errorf("invalid deployment status")
+	}
+	if len(reason) > 1 || (len(reason) == 1 && len(reason[0]) > 140) {
+		return fmt.Errorf("invalid deployment status description")
+	}
+	if len(reason) == 1 && reason[0] != "" {
+		description = reason[0]
 	}
 	_, err := g.Run(ctx, "api", "--hostname", "github.com", "--method", "POST",
 		"repos/"+Repository+"/deployments/"+strconv.FormatInt(id, 10)+"/statuses",

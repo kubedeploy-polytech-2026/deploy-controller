@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"os/signal"
 	"syscall"
@@ -16,17 +17,31 @@ import (
 )
 
 func run(ctx context.Context, once bool, interval time.Duration, step func(context.Context) (intake.Plan, error)) error {
+	failures := 0
 	for {
-		pollCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
-		plan, err := step(pollCtx)
-		cancel()
+		plan, err := step(ctx)
+		if ctx.Err() != nil {
+			return nil
+		}
+		delay := interval
 		if err != nil {
 			if once {
 				return err
 			}
 			fmt.Fprintln(os.Stderr, "poll:", err)
-		} else if err := json.NewEncoder(os.Stdout).Encode(plan); err != nil {
-			return err
+			if failures < 4 {
+				failures++
+			}
+			delay = 2 * time.Second * time.Duration(1<<failures)
+			if delay > 30*time.Second {
+				delay = 30 * time.Second
+			}
+			delay = delay/2 + time.Duration(rand.Int64N(int64(delay/2)+1))
+		} else {
+			failures = 0
+			if err := json.NewEncoder(os.Stdout).Encode(plan); err != nil {
+				return err
+			}
 		}
 		if once {
 			if plan.State == "failure" || plan.State == "error" {
@@ -34,7 +49,7 @@ func run(ctx context.Context, once bool, interval time.Duration, step func(conte
 			}
 			return nil
 		}
-		timer := time.NewTimer(interval)
+		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
@@ -44,29 +59,34 @@ func run(ctx context.Context, once bool, interval time.Duration, step func(conte
 	}
 }
 
-func main() {
+func mainRun() error {
 	once := flag.Bool("once", false, "Read and verify the newest request, then exit")
 	interval := flag.Duration("interval", 30*time.Second, "Delay between polls (minimum 10s)")
 	execute := flag.Bool("execute", false, "Apply verified requests and publish deployment status")
+	budgets := execution.DefaultBudgets()
+	flag.DurationVar(&budgets.Total, "deployment-timeout", budgets.Total, "Total deployment budget")
+	flag.DurationVar(&budgets.Apply, "apply-timeout", budgets.Apply, "Maximum time for applying resources")
+	flag.DurationVar(&budgets.Rollout, "rollout-timeout", budgets.Rollout, "Shared rollout budget")
+	flag.DurationVar(&budgets.Smoke, "smoke-timeout", budgets.Smoke, "Smoke check budget")
 	stateDir := flag.String("state-dir", "", "Persistent local state directory for one executor")
 	flag.Parse()
 	if *interval < 10*time.Second || flag.NArg() != 0 {
-		fmt.Fprintln(os.Stderr, "expected no arguments and interval >= 10s")
-		os.Exit(2)
+		return fmt.Errorf("expected no arguments and interval >= 10s")
+	}
+	if err := budgets.Validate(); err != nil {
+		return err
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	github := intake.GitHub{Run: intake.RunGH}
 	config, appEnabled, err := githubapp.FromEnv(os.Getenv)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return err
 	}
 	if appEnabled {
 		source, err := githubapp.New(config)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+			return err
 		}
 		github.Run = githubapp.Runner(source, intake.RunGHWithEnv)
 	}
@@ -78,14 +98,19 @@ func main() {
 	if *execute {
 		store, err := execution.Open(*stateDir)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+			return err
 		}
 		defer store.Close()
-		controller := execution.Controller{GitHub: github, Executor: execution.Commands{Run: execution.RunCommand, WorkDir: *stateDir}, Store: store, Now: time.Now}
+		commands := &execution.Commands{Run: execution.RunCommand, WorkDir: *stateDir}
+		defer commands.Close()
+		controller := execution.Controller{GitHub: github, Executor: commands, Store: store, Now: time.Now, Budgets: budgets}
 		step = controller.Step
 	}
-	if err := run(ctx, *once, *interval, step); err != nil {
+	return run(ctx, *once, *interval, step)
+}
+
+func main() {
+	if err := mainRun(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}

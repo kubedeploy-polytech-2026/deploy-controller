@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -37,31 +36,47 @@ func RunCommand(ctx context.Context, dir string, env []string, name string, args
 }
 
 type Commands struct {
-	Run     Command
-	WorkDir string
+	Run      Command
+	WorkDir  string
+	dir      string
+	revision string
+	env      []string
 }
 
-func (c Commands) Ready(ctx context.Context) error {
+func (c *Commands) Ready(ctx context.Context) error {
 	_, err := c.Run(ctx, "", nil, "kubectl", "--context", "k3d-kubedeploy", "--request-timeout=5s", "get", "--raw=/readyz")
 	return err
 }
 
-func (c Commands) Apply(ctx context.Context, p intake.Plan) error {
-	sha := regexp.MustCompile(`^[a-f0-9]{40}$`)
-	for component, image := range map[string]string{"backend": p.BackendImage, "frontend": p.FrontendImage} {
-		pattern := `^ghcr\.io/` + regexp.QuoteMeta(intake.Organization+"/"+component) + `@sha256:[a-f0-9]{64}$`
-		if !regexp.MustCompile(pattern).MatchString(image) {
-			return fmt.Errorf("invalid %s image", component)
-		}
+func (c *Commands) Close() error {
+	if c.dir == "" {
+		return nil
 	}
-	if !sha.MatchString(p.EnvironmentRevision) {
-		return fmt.Errorf("invalid environment revision")
+	err := os.RemoveAll(c.dir)
+	c.dir = ""
+	c.revision = ""
+	return err
+}
+
+func (c *Commands) Prepare(ctx context.Context, p intake.Plan) error {
+	if err := validatePlan(p); err != nil {
+		return err
 	}
+	if c.dir != "" && c.revision == p.EnvironmentRevision {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	dir, err := os.MkdirTemp(c.WorkDir, "environment-*")
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(dir)
+	keep := false
+	defer func() {
+		if !keep {
+			os.RemoveAll(dir)
+		}
+	}()
 	env := []string{"GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null"}
 	for _, args := range [][]string{
 		{"init", "--quiet"},
@@ -79,9 +94,84 @@ func (c Commands) Apply(ctx context.Context, p intake.Plan) error {
 	if strings.TrimSpace(string(actual)) != p.EnvironmentRevision {
 		return fmt.Errorf("checkout revision mismatch")
 	}
-	out, err := c.Run(ctx, dir, env, "make", "deploy", "BACKEND_IMAGE="+p.BackendImage, "FRONTEND_IMAGE="+p.FrontendImage)
+	contract, err := c.Run(ctx, dir, env, "make", "-s", "execution-contract")
+	if err != nil || strings.TrimSpace(string(contract)) != "1" {
+		return fmt.Errorf("environment revision does not support separate apply/wait")
+	}
+	if err = c.Close(); err != nil {
+		return err
+	}
+	c.dir, c.revision, c.env = dir, p.EnvironmentRevision, env
+	keep = true
+	return nil
+}
+
+func (c *Commands) make(ctx context.Context, p intake.Plan, args ...string) error {
+	if err := c.Prepare(ctx, p); err != nil {
+		return err
+	}
+	out, err := c.Run(ctx, c.dir, c.env, "make", args...)
 	if len(out) > 0 {
 		fmt.Fprint(os.Stderr, string(out))
 	}
 	return err
+}
+
+func (c *Commands) Apply(ctx context.Context, p intake.Plan) (Snapshot, error) {
+	if err := c.make(ctx, p, "apply", "BACKEND_IMAGE="+p.BackendImage, "FRONTEND_IMAGE="+p.FrontendImage); err != nil {
+		return nil, err
+	}
+	snapshot, _, _, err := c.snapshot(ctx, p)
+	return snapshot, err
+}
+
+func (c *Commands) Wait(ctx context.Context, p intake.Plan, snapshot Snapshot, deadline time.Time) error {
+	ready, err := c.check(ctx, p, snapshot)
+	if err != nil || ready {
+		return err
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return context.DeadlineExceeded
+	}
+	seconds := int64((remaining + time.Second - 1) / time.Second)
+	if seconds > 3600 {
+		seconds = 3600
+	}
+	err = c.make(ctx, p, "wait", fmt.Sprintf("ROLLOUT_TIMEOUT_SECONDS=%d", seconds))
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	ready, checkErr := c.check(ctx, p, snapshot)
+	if checkErr != nil {
+		return checkErr
+	}
+	if ready {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return fmt.Errorf("rollout has not reached the expected generation")
+}
+
+func (c *Commands) Smoke(ctx context.Context, p intake.Plan, snapshot Snapshot) error {
+	ready, err := c.check(ctx, p, snapshot)
+	if err != nil {
+		return err
+	}
+	if !ready {
+		return fmt.Errorf("applications are not ready for smoke")
+	}
+	if err = c.make(ctx, p, "smoke"); err != nil {
+		return err
+	}
+	ready, err = c.check(ctx, p, snapshot)
+	if err != nil {
+		return err
+	}
+	if !ready {
+		return fmt.Errorf("applications became unready during smoke")
+	}
+	return nil
 }

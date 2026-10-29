@@ -60,6 +60,8 @@ type Release struct {
 
 type Plan struct {
 	State               string     `json:"state"`
+	Phase               string     `json:"phase,omitempty"`
+	Reason              string     `json:"reason,omitempty"`
 	DeploymentID        int64      `json:"deployment_id,omitempty"`
 	EnvironmentRevision string     `json:"environment_revision,omitempty"`
 	BackendImage        string     `json:"backend_image,omitempty"`
