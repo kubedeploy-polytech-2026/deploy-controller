@@ -2,6 +2,13 @@
 .github
 .tools
 build
+candidates
+dist
+image.tar.gz
+image-inspect.json
+candidate.json
+sbom.cdx.json
+trivy.json
 **/*.pem
 **/*.key
 **/.env
